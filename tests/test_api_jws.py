@@ -476,6 +476,110 @@ class TestJWS:
 
         assert "Invalid crypto padding" in str(exc.value)
 
+    def test_decode_rejects_non_canonical_crypto_segment(self, jws, payload):
+        secret = "a" * 32
+        token = jws.encode(payload, secret, algorithm="HS256")
+        header, encoded_payload, signature = token.split(".")
+        mutated_token = ".".join((header, encoded_payload, f"{signature}!!!!"))
+
+        with pytest.raises(DecodeError, match="Invalid crypto padding"):
+            jws.decode(mutated_token, secret, algorithms=["HS256"])
+
+    def test_decode_accepts_padded_crypto_segment(self, jws, payload):
+        secret = "a" * 32
+        token = jws.encode(payload, secret, algorithm="HS256")
+        header, encoded_payload, signature = token.split(".")
+        pad = "=" * ((4 - len(signature) % 4) % 4)
+        assert pad, (
+            "HS256 signatures should need padding when restored to 4-char groups"
+        )
+        padded_token = ".".join((header, encoded_payload, signature + pad))
+
+        assert jws.decode(padded_token, secret, algorithms=["HS256"]) == payload
+
+    def test_decode_rejects_embedded_padding_in_crypto_segment(self, jws, payload):
+        secret = "a" * 32
+        token = jws.encode(payload, secret, algorithm="HS256")
+        header, encoded_payload, signature = token.split(".")
+        mutated_token = ".".join(
+            (header, encoded_payload, signature[:2] + "=" + signature[2:])
+        )
+
+        with pytest.raises(DecodeError, match="Invalid crypto padding"):
+            jws.decode(mutated_token, secret, algorithms=["HS256"])
+
+    def test_decode_rejects_non_canonical_trailing_bits_in_crypto_segment(
+        self, jws, payload
+    ):
+        secret = "a" * 32
+        token = jws.encode(payload, secret, algorithm="HS256")
+        header, encoded_payload, signature = token.split(".")
+        alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        # A 32-byte HS256 signature is 43 base64url chars, so the two lowest
+        # bits of the last char are unused; flipping one keeps the decoded
+        # signature bytes identical while changing the token string.
+        assert len(signature) % 4 == 3
+        last = alphabet[alphabet.index(signature[-1]) ^ 1]
+        mutated_token = ".".join((header, encoded_payload, signature[:-1] + last))
+        assert mutated_token != token
+
+        with pytest.raises(DecodeError, match="Invalid crypto padding"):
+            jws.decode(mutated_token, secret, algorithms=["HS256"])
+
+    def test_decode_rejects_standard_alphabet_in_crypto_segment(self, jws):
+        secret = "a" * 32
+        # Find a deterministic HS256 signature that contains '-' or '_' so
+        # swapping to the standard base64 alphabet ('+' / '/') yields an
+        # alternate serialization with the same decoded signature bytes.
+        for i in range(1000):
+            token = jws.encode(b"hello world %d" % i, secret, algorithm="HS256")
+            header, encoded_payload, signature = token.split(".")
+            if "-" in signature or "_" in signature:
+                break
+        else:
+            pytest.fail("no HS256 signature containing '-' or '_' was found")
+
+        jws.decode(token, secret, algorithms=["HS256"])
+        swapped = signature.replace("-", "+").replace("_", "/")
+        mutated_token = ".".join((header, encoded_payload, swapped))
+        assert mutated_token != token
+
+        with pytest.raises(DecodeError, match="Invalid crypto padding"):
+            jws.decode(mutated_token, secret, algorithms=["HS256"])
+
+    def test_decode_rejects_non_canonical_header_segment(self, jws, payload):
+        secret = "a" * 32
+        token = jws.encode(payload, secret, algorithm="HS256")
+        header, encoded_payload, signature = token.split(".")
+        mutated_token = ".".join((f"{header}!!!!", encoded_payload, signature))
+
+        with pytest.raises(DecodeError, match="Invalid header padding"):
+            jws.get_unverified_header(mutated_token)
+
+    def test_decode_rejects_non_canonical_payload_segment(self, jws, payload):
+        secret = "a" * 32
+        token = jws.encode(payload, secret, algorithm="HS256")
+        header, encoded_payload, signature = token.split(".")
+        mutated_token = ".".join((header, f"{encoded_payload}!!!!", signature))
+
+        with pytest.raises(DecodeError, match="Invalid payload padding"):
+            jws.decode(mutated_token, options={"verify_signature": False})
+
+    @pytest.mark.parametrize(
+        ("segment", "decoded"),
+        [(b"Zg", b"f"), (b"Zg==", b"f"), (b"Zm8=", b"fo"), (b"-_8", b"\xfb\xff")],
+    )
+    def test_decode_accepts_canonical_base64url_padding(self, segment, decoded):
+        assert PyJWS._decode_base64url_segment(segment, "crypto") == decoded
+
+    @pytest.mark.parametrize(
+        "segment",
+        [b"Zg===", b"Zg=", b"a", b"Z?==", b"Zh", b"Zh==", b"+/8", b"+/8=", b"Zm8\n"],
+    )
+    def test_decode_rejects_invalid_base64url_padding(self, segment):
+        with pytest.raises(DecodeError, match="Invalid crypto padding"):
+            PyJWS._decode_base64url_segment(segment, "crypto")
+
     def test_decode_with_algo_none_should_fail(self, jws, payload):
         jws_message = jws.encode(payload, key=None, algorithm=None)
 
