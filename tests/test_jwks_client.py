@@ -467,18 +467,50 @@ class TestPyJWKClient:
 
         assert repeated_call.call_count == 1
 
-    def test_get_jwt_set_failed_request_should_clear_cache(self):
+    def test_get_jwt_set_failed_refresh_preserves_cached_jwks(self):
+        # Regression: a transient fetch failure used to clear the cache via
+        # the previous `finally: put(jwk_set=None)` pattern, turning one bad
+        # request from the JWKS endpoint into application-wide auth failure.
+        # The cache must survive.
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
 
         jwks_client = PyJWKClient(url)
         with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
             jwks_client.get_jwk_set()
 
+        assert jwks_client.jwk_set_cache is not None
+        assert jwks_client.jwk_set_cache.get() is not None
+
         with pytest.raises(PyJWKClientError):
             with mocked_failed_response():
                 jwks_client.get_jwk_set(refresh=True)
 
-            assert jwks_client.jwk_set_cache is None
+        cached = jwks_client.jwk_set_cache.get()
+        assert cached is not None
+        # Subsequent reads still serve from cache without another fetch.
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID) as call:
+            jwks_client.get_jwk_set()
+        assert call.call_count == 0
+
+    def test_failed_refresh_does_not_break_known_kid_lookup(self):
+        # CVE-2026-48524: a JWKS endpoint that starts failing (e.g. because
+        # an attacker's unknown-kid tokens got the relying party rate
+        # limited) must not wipe the cached keys, otherwise every
+        # legitimate token is rejected afterwards.
+        url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"
+        kid = "NEE1QURBOTM4MzI5RkFDNTYxOTU1MDg2ODgwQ0UzMTk1QjYyRkRFQw"
+
+        jwks_client = PyJWKClient(url, cooldown_duration=0)
+        with mocked_success_response(RESPONSE_DATA_WITH_MATCHING_KID):
+            assert jwks_client.get_signing_key(kid).key_id == kid
+
+        with mocked_failed_response():
+            with pytest.raises(PyJWKClientConnectionError):
+                jwks_client.get_signing_key("attacker-unknown-kid")
+
+        with mocked_failed_response() as failed_call:
+            assert jwks_client.get_signing_key(kid).key_id == kid
+        assert failed_call.call_count == 0
 
     def test_failed_request_should_raise_connection_error(self):
         token = "eyJ0eXAiOiJKV1QiLCJhbGciOiJSUzI1NiIsImtpZCI6Ik5FRTFRVVJCT1RNNE16STVSa0ZETlRZeE9UVTFNRGcyT0Rnd1EwVXpNVGsxUWpZeVJrUkZRdyJ9.eyJpc3MiOiJodHRwczovL2Rldi04N2V2eDlydS5hdXRoMC5jb20vIiwic3ViIjoiYVc0Q2NhNzl4UmVMV1V6MGFFMkg2a0QwTzNjWEJWdENAY2xpZW50cyIsImF1ZCI6Imh0dHBzOi8vZXhwZW5zZXMtYXBpIiwiaWF0IjoxNTcyMDA2OTU0LCJleHAiOjE1NzIwMDY5NjQsImF6cCI6ImFXNENjYTc5eFJlTFdVejBhRTJINmtEME8zY1hCVnRDIiwiZ3R5IjoiY2xpZW50LWNyZWRlbnRpYWxzIn0.PUxE7xn52aTCohGiWoSdMBZGiYAHwE5FYie0Y1qUT68IHSTXwXVd6hn02HTah6epvHHVKA2FqcFZ4GGv5VTHEvYpeggiiZMgbxFrmTEY0csL6VNkX1eaJGcuehwQCRBKRLL3zKmA5IKGy5GeUnIbpPHLHDxr-GXvgFzsdsyWlVQvPX2xjeaQ217r2PtxDeqjlf66UYl6oY6AqNS8DH3iryCvIfCcybRZkc_hdy-6ZMoKT6Piijvk_aXdm7-QQqKJFHLuEqrVSOuBqqiNfVrG27QzAPuPOxvfXTVLXL2jek5meH6n-VWgrBdoMFH93QEszEDowDAEhQPHVs0xj7SIzA"
@@ -687,6 +719,56 @@ class TestPyJWKClient:
         with pytest.raises(PyJWKClientError):
             jwks_client = PyJWKClient(url, lifespan=-1)
             assert jwks_client is None
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "file:///etc/passwd",
+            "ftp://example.org/keys.json",
+            'data:application/json,{"keys":[]}',
+            "/etc/passwd",  # urlparse gives scheme="" -- also rejected
+            "ldap://internal.test/jwks",
+        ],
+    )
+    def test_pyjwkclient_rejects_non_http_schemes(self, uri):
+        # urllib's default OpenerDirector handles file://, ftp://, and data:
+        # URIs. PyJWKClient must reject these so callers can't be tricked
+        # into reading attacker-controlled local files or other unintended
+        # schemes via a manipulated URI.
+        with pytest.raises(PyJWKClientError, match="Invalid JWKS URI scheme"):
+            PyJWKClient(uri)
+
+    @pytest.mark.parametrize(
+        "uri",
+        [
+            "http://localhost/jwks.json",
+            "https://example.test/jwks.json",
+            "HTTPS://Example.Test/jwks.json",  # case-insensitive
+        ],
+    )
+    def test_pyjwkclient_accepts_http_https_schemes(self, uri):
+        # Construction succeeds; no fetch is made until get_jwk_set().
+        PyJWKClient(uri)
+
+    def test_pyjwkclient_file_uri_cannot_load_planted_jwks(self, tmp_path):
+        # CVE-2026-48522: an attacker able to plant a JWK Set on disk and to
+        # influence the JWKS URI (e.g. via a `jku` header) must not get it
+        # loaded through urllib's file:// handler.
+        jwks_file = tmp_path / "attacker_jwks.json"
+        jwks_file.write_text(json.dumps(RESPONSE_DATA_WITH_MATCHING_KID))
+
+        with pytest.raises(PyJWKClientError, match="Invalid JWKS URI scheme"):
+            jwks_client = PyJWKClient(jwks_file.as_uri())
+            jwks_client.get_jwk_set()
+
+    def test_pyjwkclient_data_uri_cannot_supply_jwks(self):
+        # CVE-2026-48522: data: URIs are handled by urllib's default opener
+        # and would let a manipulated URI inline an attacker-chosen JWK Set.
+        uri = "data:application/json," + json.dumps(RESPONSE_DATA_WITH_MATCHING_KID)
+
+        with pytest.raises(PyJWKClientError, match="Invalid JWKS URI scheme"):
+            jwks_client = PyJWKClient(uri)
+            jwks_client.get_jwk_set()
 
     def test_get_jwt_set_timeout(self):
         url = "https://dev-87evx9ru.auth0.com/.well-known/jwks.json"

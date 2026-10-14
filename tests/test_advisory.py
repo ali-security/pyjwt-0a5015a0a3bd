@@ -1,10 +1,16 @@
+import hashlib
+import hmac
+import json
+
 import pytest
 
 import jwt
 from jwt.algorithms import get_default_algorithms
-from jwt.exceptions import InvalidKeyError
+from jwt.exceptions import DecodeError, InvalidKeyError, PyJWKClientError
+from jwt.utils import base64url_decode, base64url_encode
 
-from .utils import crypto_required
+from .keys import load_rsa_key
+from .utils import crypto_required, key_path
 
 priv_key_bytes = b"""-----BEGIN PRIVATE KEY-----
 MC4CAQAwBQYDK2VwBCIEIIbBhdo2ah7X32i50GOzrCr4acZTe6BezUdRIixjTAdL
@@ -116,4 +122,99 @@ class TestAdvisory:
                 encoded_bad,
                 ssh_key_bytes,
                 algorithms=algorithm_names,
+            )
+
+    def test_cve_2026_48526_public_jwk_json_not_accepted_as_hmac_secret(self):
+        # GHSA-xgmm-8j9v-c9wx: a verifier that accepts both HMAC and
+        # asymmetric algorithms and passes the issuer's public key as raw
+        # JWK JSON must not let an attacker forge an HS256 token by using
+        # that (public) JSON document as the HMAC secret.
+        with open(key_path("jwk_rsa_pub.json")) as keyfile:
+            public_jwk_json = keyfile.read()
+
+        header_b64 = base64url_encode(
+            json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode()
+        )
+        claims_b64 = base64url_encode(
+            json.dumps({"sub": "admin", "role": "admin"}).encode()
+        )
+        signing_input = b".".join([header_b64, claims_b64])
+        signature = hmac.new(
+            public_jwk_json.encode(), signing_input, hashlib.sha256
+        ).digest()
+        forged = b".".join([signing_input, base64url_encode(signature)]).decode()
+
+        for key in (public_jwk_json, public_jwk_json.encode()):
+            with pytest.raises(InvalidKeyError, match="looks like a JWK"):
+                jwt.decode(forged, key, algorithms=["HS256", "RS256"])
+
+    @pytest.mark.parametrize(
+        "header",
+        [
+            {"alg": "HS256", "typ": "JWT", "b64": False, "crit": ["b64"]},
+            {"alg": "HS256", "typ": "JWT", "b64": False},
+        ],
+    )
+    def test_cve_2026_48525_b64_false_payload_segment_is_not_decoded(
+        self, header, monkeypatch
+    ):
+        # GHSA-w7vc-732c-9m39: with "b64": false the compact payload segment
+        # is unused (the caller supplies detached_payload), so an inflated
+        # segment must be rejected before any Base64URL decoding work is
+        # spent on it -- no valid key or signature is needed to trigger it.
+        header_b64 = base64url_encode(
+            json.dumps(header, separators=(",", ":")).encode()
+        )
+        inflated_segment = b"A" * 2000000
+        bogus_signature = base64url_encode(b"\x00" * 32)
+        token = b".".join([header_b64, inflated_segment, bogus_signature])
+
+        decoded_sizes = []
+
+        def spy_base64url_decode(data):
+            decoded_sizes.append(len(data))
+            return base64url_decode(data)
+
+        monkeypatch.setattr("jwt.api_jws.base64url_decode", spy_base64url_decode)
+
+        with pytest.raises(DecodeError, match="Payload segment must be empty"):
+            jwt.decode(
+                token,
+                "secret",
+                algorithms=["HS256"],
+                detached_payload=b"signed request body",
+            )
+
+        assert all(size < len(inflated_segment) for size in decoded_sizes)
+
+    @crypto_required
+    def test_cve_2026_48522_jku_file_uri_cannot_plant_jwks(self, tmp_path):
+        # GHSA-993g-76c3-p5m4: an attacker who can write a JWK Set to disk
+        # and influence the JWKS URI (e.g. an application that trusts the
+        # token's `jku` header) must not be able to get tokens signed with
+        # their own key accepted through urllib's file:// handler.
+        from jwt.algorithms import RSAAlgorithm
+
+        attacker_key = load_rsa_key()
+        public_jwk = RSAAlgorithm.to_jwk(attacker_key.public_key(), as_dict=True)
+        public_jwk["kid"] = "attacker-key"
+        jwks_file = tmp_path / "attacker_jwks.json"
+        jwks_file.write_text(json.dumps({"keys": [public_jwk]}))
+
+        token = jwt.encode(
+            {"sub": "attacker", "aud": "target-app"},
+            attacker_key,
+            algorithm="RS256",
+            headers={"kid": "attacker-key", "jku": jwks_file.as_uri()},
+        )
+
+        unverified_header = jwt.get_unverified_header(token)
+        with pytest.raises(PyJWKClientError, match="Invalid JWKS URI scheme"):
+            jwks_client = jwt.PyJWKClient(unverified_header["jku"])
+            signing_key = jwks_client.get_signing_key_from_jwt(token)
+            jwt.decode(
+                token,
+                signing_key.key,
+                algorithms=["RS256"],
+                audience="target-app",
             )
