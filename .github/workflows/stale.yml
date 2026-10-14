@@ -1,8 +1,6 @@
 name: 'Stale issue handler'
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '30 1 * * *'
 
 permissions:
   issues: write
@@ -10,6 +8,8 @@ permissions:
 
 jobs:
   stale:
+    if: false
+    timeout-minutes: 10
     runs-on: ubuntu-latest
     steps:
       - uses: actions/stale@v8
